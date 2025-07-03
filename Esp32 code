@@ -1,1 +1,480 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <NTPClient.h>
+#include <PZEM004Tv30.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <TimeLib.h>
+#include <FirebaseESP32.h>
+#include <ArduinoJson.h>
+#include <math.h>
 
+// WiFi Settings
+const char* ssid = "Dialog 4G";
+const char* password = "R81LN3R22L3";
+
+// Firebase Settings
+#define FIREBASE_HOST "https://energywise-9be26-default-rtdb.asia-southeast1.firebasedatabase.app/"
+#define FIREBASE_AUTH "AIzaSyCx1p6turiiFIpAqXpSJ02f1-C20ZggvAw"
+
+// Hardware Pins
+#define RX_PIN 16
+#define TX_PIN 17
+#define BACKLIGHT_BUTTON_PIN 19
+
+// Backlight settings
+#define BACKLIGHT_TIMEOUT 120000 // 2 minutes in milliseconds
+
+// Initialize components
+HardwareSerial pzemSerial(2);
+PZEM004Tv30 pzem(pzemSerial, RX_PIN, TX_PIN);
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 19800, 60000);
+
+// Firebase instances
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Timing control
+unsigned long lastFirebaseUpdate = 0;
+const unsigned long fbUpdateInterval = 300000; // 5 minutes
+unsigned long lastDisplayUpdate = 0;
+const unsigned long displayUpdateInterval = 1000; // 1 second
+unsigned long lastSensorReset = 0;
+const unsigned long sensorResetInterval = 300000; // 5 minutes
+
+// Energy tracking variables
+float currentDayEnergy = 0.0;
+float currentMonthEnergy = 0.0;
+float previousMonthEnergy = 0.0;
+float lastStoredEnergy = 0.0;
+float maxPowerToday = 0.0;
+int currentDay = 0;
+int currentMonth = 0;
+int currentYear = 0;
+bool dayChanged = false;
+bool monthChanged = false;
+bool displayInitialized = false;
+bool powerOnState = false;
+bool daySaved = false;
+
+// Backlight control variables
+bool backlightState = true;
+unsigned long backlightLastActive = 0;
+bool buttonPressed = false;
+unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 50;
+
+void setup() {
+    Serial.begin(9600);
+    
+    // Initialize LCD with proper delays
+    Wire.begin();
+    lcd.init();
+    delay(100);
+    lcd.backlight();
+    delay(100);
+    lcd.clear();
+    delay(100);
+    lcd.setCursor(0, 0);
+    lcd.print("Initializing...");
+    delay(100);
+    
+    // Initialize PZEM
+    pzemSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+    
+    // Initialize backlight button
+    pinMode(BACKLIGHT_BUTTON_PIN, INPUT_PULLUP);
+    
+    // Connect to WiFi
+    connectToWiFi();
+    
+    // Initialize time client
+    timeClient.begin();
+    while(!timeClient.update()) {
+        timeClient.forceUpdate();
+        delay(100);
+    }
+    
+    // Configure Firebase
+    config.host = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
+
+    // Initialize date variables
+    updateTime();
+    loadPreviousMonthData();
+    loadCurrentDayData();
+    
+    displayInitialized = true;
+    showSplashScreen();
+
+    // Initial sensor reading
+    for(int i = 0; i < 5; i++) {
+        float v, c, p, e, f;
+        readSensorData(v, c, p, e, f);
+        delay(200);
+    }
+    
+    backlightLastActive = millis();
+}
+
+void connectToWiFi() {
+    Serial.print("Connecting to WiFi");
+    lcd.setCursor(0, 1);
+    lcd.print("Connecting WiFi...");
+    
+    WiFi.begin(ssid, password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        lcd.print(".");
+        attempts++;
+    }
+    
+    if(WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+        lcd.setCursor(0, 2);
+        lcd.print("WiFi Connected    ");
+    } else {
+        Serial.println("\nFailed to connect to WiFi");
+        lcd.setCursor(0, 2);
+        lcd.print("WiFi Failed!      ");
+    }
+}
+
+bool readSensorData(float &voltage, float &current, float &power, float &energy, float &frequency) {
+    static float lastValidVoltage = 0.0;
+    static float lastValidCurrent = 0.0;
+    static float lastValidPower = 0.0;
+    static float lastValidEnergy = 0.0;
+    static float lastValidFrequency = 50.0;
+    
+    for(int attempt = 0; attempt < 5; attempt++) {
+        voltage = pzem.voltage();
+        if(!isnan(voltage)) lastValidVoltage = voltage;
+        
+        current = pzem.current();
+        if(!isnan(current)) lastValidCurrent = current;
+        
+        power = pzem.power();
+        if(!isnan(power)) {
+            lastValidPower = power;
+            checkMaxPower(power);
+        }
+        
+        energy = pzem.energy();
+        if(!isnan(energy)) lastValidEnergy = energy;
+        
+        frequency = pzem.frequency();
+        if(!isnan(frequency)) lastValidFrequency = frequency;
+        
+        if(!isnan(voltage) && voltage > 50.0 && voltage < 300.0) {
+            // Only require valid voltage for successful reading
+            // Current can be 0 when no load is connected
+            current = isnan(current) ? 0.0 : current;
+            power = isnan(power) ? 0.0 : power;
+            energy = isnan(energy) ? lastValidEnergy : energy;
+            frequency = isnan(frequency) ? 50.0 : frequency;
+            return true;
+        }
+        
+        pzemSerial.flush();
+        delay(50);
+    }
+    
+    voltage = lastValidVoltage;
+    current = lastValidCurrent;
+    power = lastValidPower;
+    energy = lastValidEnergy;
+    frequency = lastValidFrequency;
+    
+    return false;
+}
+
+void checkMaxPower(float currentPower) {
+    if (currentPower > maxPowerToday) {
+        maxPowerToday = currentPower;
+    }
+}
+
+void showSplashScreen() {
+    if(!displayInitialized) return;
+    
+    lcd.clear();
+    delay(10);
+    lcd.setCursor(4, 0);
+    lcd.print("ENERGYWISE");
+    lcd.setCursor(3, 1);
+    lcd.print("POWER MONITOR");
+    lcd.setCursor(0, 2);
+    lcd.print("Version 1.0");
+    lcd.setCursor(0, 3);
+    lcd.print("Loading data...");
+    delay(2000);
+    lcd.clear();
+    delay(10);
+}
+
+void updateDisplay(int y, int m, int d, int h, int min, 
+                 float voltage, float current, float power, float dailyEnergy) {
+    if(!displayInitialized) return;
+    
+    lcd.clear();
+    delay(10);
+    
+    // Force write to first character position to prevent blinking
+    lcd.setCursor(0, 0);
+    lcd.print(" ");
+    lcd.setCursor(0, 0);
+    
+    // Line 1: Date and Time with WiFi status
+    lcd.printf("%02d/%02d/%04d %02d:%02d", d, m, y, h, min);
+    lcd.setCursor(18, 0);
+    lcd.print(WiFi.status() == WL_CONNECTED ? "W" : "X");
+    
+    // Line 2: Voltage and Current
+    lcd.setCursor(0, 1);
+    if (voltage < 100) {
+        lcd.printf("V:%5.1fV  I:%5.3fA", voltage, current);
+    } else {
+        lcd.printf("V:%6.1fV I:%5.3fA", voltage, current);
+    }
+    
+    // Line 3: Power and Frequency
+    lcd.setCursor(0, 2);
+    lcd.printf("P:%6.1fW F:%5.1fHz", power, 50.0);
+    
+    // Line 4: Energy (Daily/Total)
+    lcd.setCursor(0, 3);
+    lcd.printf("Unit:%5.2f ", dailyEnergy);
+    lcd.setCursor(13, 3);
+    lcd.printf("Tot:%5.1f", currentMonthEnergy);
+    
+    // Backlight indicator
+    lcd.setCursor(19, 0);
+    lcd.print(backlightState ? "*" : " ");
+}
+
+void handleBacklightControl() {
+    if (digitalRead(BACKLIGHT_BUTTON_PIN) == LOW) {
+        if (!buttonPressed && (millis() - lastButtonPress) > debounceDelay) {
+            buttonPressed = true;
+            lastButtonPress = millis();
+            
+            backlightState = !backlightState;
+            if (backlightState) {
+                lcd.backlight();
+                backlightLastActive = millis();
+            } else {
+                lcd.noBacklight();
+            }
+        }
+    } else {
+        buttonPressed = false;
+    }
+    
+    if (backlightState && (millis() - backlightLastActive) > BACKLIGHT_TIMEOUT) {
+        backlightState = false;
+        lcd.noBacklight();
+    }
+}
+
+void updateTime() {
+    timeClient.update();
+    time_t rawTime = timeClient.getEpochTime();
+    setTime(rawTime);
+    currentDay = day();
+    currentMonth = month();
+    currentYear = year();
+}
+
+void loadPreviousMonthData() {
+    int prevMonth = currentMonth - 1;
+    int prevYear = currentYear;
+    if (prevMonth < 1) {
+        prevMonth = 12;
+        prevYear--;
+    }
+    
+    String path = "/monthly_data/" + String(prevYear) + "/" + String(prevMonth) + "/total_energy";
+    
+    if (Firebase.getFloat(fbdo, path)) {
+        previousMonthEnergy = fbdo.floatData();
+        Serial.println("Loaded previous month energy: " + String(previousMonthEnergy));
+    } else {
+        Serial.println("Failed to load previous month data. Setting to 0");
+        previousMonthEnergy = 0.0;
+    }
+}
+
+void loadCurrentDayData() {
+    String path = "/daily_data/" + String(currentYear) + "/" + String(currentMonth) + "/" + String(currentDay) + "/energy";
+    
+    if (Firebase.getFloat(fbdo, path)) {
+        currentDayEnergy = fbdo.floatData();
+        Serial.println("Loaded today's energy: " + String(currentDayEnergy));
+    } else {
+        Serial.println("No data for today. Starting from 0");
+        currentDayEnergy = 0.0;
+    }
+}
+
+void saveDailySummary() {
+    String path = "/daily_summary/" + String(currentYear) + "/" + String(currentMonth) + "/" + String(currentDay);
+    
+    FirebaseJson json;
+    json.set("date", getFormattedDate(currentYear, currentMonth, currentDay));
+    json.set("total_energy", currentDayEnergy);
+    json.set("max_power", maxPowerToday);
+    json.set("timestamp", timeClient.getEpochTime());
+    
+    if (Firebase.setJSON(fbdo, path, json)) {
+        Serial.println("Daily summary saved successfully!");
+        daySaved = true;
+    } else {
+        Serial.println("Failed to save daily summary: " + fbdo.errorReason());
+    }
+}
+
+void saveMonthlyData() {
+    String path = "/monthly_data/" + String(currentYear) + "/" + String(currentMonth);
+    
+    FirebaseJson json;
+    json.set("total_energy", currentMonthEnergy);
+    json.set("year", currentYear);
+    json.set("month", currentMonth);
+    json.set("last_updated", getFormattedTimestamp(currentYear, currentMonth, currentDay, hour(), minute()));
+    
+    if (Firebase.setJSON(fbdo, path, json)) {
+        Serial.println("Monthly data saved successfully!");
+    } else {
+        Serial.println("Failed to save monthly data: " + fbdo.errorReason());
+    }
+}
+
+void resetDailyValues() {
+    currentDayEnergy = 0.0;
+    maxPowerToday = 0.0;
+    lastStoredEnergy = 0.0;
+    daySaved = false;
+}
+
+void checkDayChange() {
+    if (currentDay != day()) {
+        dayChanged = true;
+        saveDailySummary();
+        resetDailyValues();
+        currentDay = day();
+        loadCurrentDayData();
+    }
+}
+
+void checkMonthChange() {
+    if (currentMonth != month()) {
+        monthChanged = true;
+        saveMonthlyData();
+        previousMonthEnergy = currentMonthEnergy;
+        currentMonth = month();
+        currentMonthEnergy = 0.0;
+        resetDailyValues();
+        loadPreviousMonthData();
+    }
+}
+
+void loop() {
+    checkWiFiConnection();
+    handleBacklightControl();
+    updateTime();
+    
+    checkDayChange();
+    checkMonthChange();
+
+    float voltage, current, power, energy, frequency;
+    bool validReadings = readSensorData(voltage, current, power, energy, frequency);
+
+    if(millis() - lastSensorReset >= sensorResetInterval) {
+        lastSensorReset = millis();
+        pzemSerial.end();
+        delay(100);
+        pzemSerial.begin(9600, SERIAL_8N1, RX_PIN, TX_PIN);
+    }
+
+    bool currentPowerOnState = (voltage > 50.0 && validReadings);
+    if (powerOnState && !currentPowerOnState) {
+        lastStoredEnergy = 0.0;
+        energy = 0.0;
+    }
+    powerOnState = currentPowerOnState;
+
+    float energyDiff = energy - lastStoredEnergy;
+    if(energyDiff > 0) {
+        currentDayEnergy += energyDiff;
+        currentMonthEnergy += energyDiff;
+    }
+    lastStoredEnergy = energy;
+
+    if (millis() - lastDisplayUpdate >= displayUpdateInterval) {
+        lastDisplayUpdate = millis();
+        updateDisplay(currentYear, currentMonth, currentDay, hour(), minute(), 
+                     voltage, current, power, currentDayEnergy);
+    }
+
+    if (validReadings && millis() - lastFirebaseUpdate >= fbUpdateInterval) {
+        lastFirebaseUpdate = millis();
+        sendToFirebase(currentYear, currentMonth, currentDay, hour(), minute(), 
+                      voltage, current, power, currentDayEnergy, frequency);
+    }
+
+    // Daily midnight save (at 23:59:50)
+    if (hour() == 23 && minute() == 59 && second() >= 50 && !daySaved) {
+        saveDailySummary();
+    }
+
+    delay(1000);
+}
+
+void sendToFirebase(int y, int m, int d, int h, int min, 
+                   float voltage, float current, float power, float dailyEnergy, float frequency) {
+    String path = "/energy_data/" + String(y) + "/" + String(m) + "/" + String(d);
+    
+    FirebaseJson json;
+    json.set("timestamp", getFormattedTimestamp(y, m, d, h, min));
+    json.set("voltage", voltage);
+    json.set("current", current);
+    json.set("power", power);
+    json.set("frequency", frequency);
+    json.set("daily_energy", dailyEnergy);
+    json.set("current_month_energy", currentMonthEnergy);
+    json.set("previous_month_energy", previousMonthEnergy);
+    
+    if (!Firebase.pushJSON(fbdo, path, json)) {
+        Serial.println("Firebase Error: " + fbdo.errorReason());
+    }
+}
+
+String getFormattedDate(int y, int m, int d) {
+    return String(y) + "-" + String(m) + "-" + String(d);
+}
+
+String getFormattedTimestamp(int y, int m, int d, int h, int min) {
+    return String(y) + "-" + String(m) + "-" + String(d) + " " + String(h) + ":" + String(min);
+}
+
+void checkWiFiConnection() {
+    if (WiFi.status() != WL_CONNECTED) {
+        WiFi.disconnect();
+        delay(1000);
+        WiFi.begin(ssid, password);
+        
+        unsigned long startTime = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+            delay(500);
+        }
+    }
+}
