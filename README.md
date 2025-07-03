@@ -64,6 +64,3 @@ A real-time energy usage monitoring system using **ESP32**, **PZEM-004T v3.0**, 
 /monthly_data/YYYY/MM/
     - total_energy
     - last_updated
-![WhatsApp Image 2025-05-28 at 09 54 04_bc62c445](https://github.com/user-attachments/assets/a03f5949-d835-4a08-a150-8b1e7d999ea5)
-![WhatsApp Image 2025-05-28 at 09 35 31_e200eba6](https://github.com/user-attachments/assets/e27b42c4-749c-4515-8006-fd0572c46d6c)
-![WhatsApp Image 2025-05-28 at 09 08 50_ad0002d8](https://github.com/user-attachments/assets/b3d6e651-16be-4709-8180-4fb91bc07743)
