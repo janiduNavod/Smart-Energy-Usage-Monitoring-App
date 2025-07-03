@@ -64,3 +64,5 @@ A real-time energy usage monitoring system using **ESP32**, **PZEM-004T v3.0**, 
 /monthly_data/YYYY/MM/
     - total_energy
     - last_updated
+
+##Esp32 code in a hardware working code 
